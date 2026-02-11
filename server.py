@@ -2,7 +2,7 @@
 """
 Character Card Index Server - SQLite Edition
 Monitors folders for character cards, indexes metadata, serves search API.
-Auto-deletes prohibited content and detects duplicates.
+Flags prohibited content for manual review and detects duplicates.
 
 Uses SQLite + FTS5 for fast full-text search at scale (200k+ cards).
 
@@ -12,7 +12,6 @@ Configuration via environment variables:
                         Example: C:/Cards/folder1:D:/Cards/folder2
   CARD_HOST           - Host to bind to (default: 0.0.0.0)
   CARD_PORT           - Port to bind to (default: 8787)
-  CARD_AUTO_DELETE    - Auto-delete prohibited content (default: true)
   CARD_DETECT_DUPES   - Detect duplicates (default: true)
   CARD_DB_FILE        - SQLite database file (default: /var/lib/card-index/cards.db)
 """
@@ -98,7 +97,7 @@ LOREBOOK_DIRS = parse_path_list(os.environ.get("LOREBOOK_DIRS", ""))
 HOST = os.environ.get("CARD_HOST", "0.0.0.0")
 PORT = int(os.environ.get("CARD_PORT", "8787"))
 RECURSIVE = os.environ.get("CARD_RECURSIVE", "true").lower() == "true"
-AUTO_DELETE_PROHIBITED = os.environ.get("CARD_AUTO_DELETE", "true").lower() == "true"
+# AUTO_DELETE_PROHIBITED removed - now using manual review for prohibited content
 DETECT_DUPLICATES = os.environ.get("CARD_DETECT_DUPES", "true").lower() == "true"
 NEXTCLOUD_USER = os.environ.get("NEXTCLOUD_USER", "")
 DB_FILE = os.environ.get("CARD_DB_FILE", "/var/lib/card-index/cards.db")
@@ -504,9 +503,17 @@ class CardIndexDB:
                     indexed_at TEXT NOT NULL,
                     content_hash TEXT DEFAULT '',
                     image_hash TEXT DEFAULT '',
-                    file_mtime REAL DEFAULT 0
+                    file_mtime REAL DEFAULT 0,
+                    prohibited INTEGER DEFAULT 0
                 )
             """)
+            
+            # Add prohibited column to existing cards tables (migration)
+            cur.execute("PRAGMA table_info(cards)")
+            columns = [row[1] for row in cur.fetchall()]
+            if 'prohibited' not in columns:
+                cur.execute("ALTER TABLE cards ADD COLUMN prohibited INTEGER DEFAULT 0")
+                logger.info("Added 'prohibited' column to cards table")
 
             # FTS5 virtual table for full-text search
             cur.execute("""
@@ -545,15 +552,28 @@ class CardIndexDB:
                 END
             """)
 
-            # Prohibited deletions log
+            # Quarantine - cards flagged for manual review
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS prohibited_deleted (
+                CREATE TABLE IF NOT EXISTS quarantine (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     path TEXT NOT NULL,
-                    tags TEXT NOT NULL,
-                    deleted_at TEXT NOT NULL
+                    matches TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reason TEXT,
+                    quarantined_at TEXT NOT NULL
                 )
             """)
+
+            # Migrate old data from prohibited_deleted to quarantine
+            try:
+                cur.execute("""
+                    INSERT OR IGNORE INTO quarantine (path, matches, status, reason, quarantined_at)
+                    SELECT path, tags, 'flagged', 'Legacy prohibited detection', deleted_at
+                    FROM prohibited_deleted
+                """)
+                cur.execute("DROP TABLE IF EXISTS prohibited_deleted")
+            except sqlite3.OperationalError:
+                pass  # Table might not exist or already migrated
 
             # Ignored duplicates
             cur.execute("""
@@ -849,33 +869,63 @@ class CardIndexDB:
             logger.error(f"Error writing metadata to {filepath}: {e}")
             return False
 
-    def add_prohibited_deleted(self, path: str, tags: List[str]):
-        """Log a prohibited card deletion."""
+    def add_quarantine(self, path: str, matches: List[str], status: str, reason: str):
+        """Add a card to quarantine for manual review."""
         with self._cursor() as cur:
             cur.execute(
-                "INSERT INTO prohibited_deleted (path, tags, deleted_at) VALUES (?, ?, ?)",
-                (path, json.dumps(list(tags)), datetime.utcnow().isoformat())
+                "INSERT OR REPLACE INTO quarantine (path, matches, status, reason, quarantined_at) VALUES (?, ?, ?, ?, ?)",
+                (path, json.dumps(matches), status, reason, datetime.utcnow().isoformat())
             )
 
-    def get_prohibited_deleted(self, limit: int = 100) -> List[dict]:
-        """Get list of prohibited deleted cards."""
-        with self._cursor() as cur:
-            cur.execute(
-                "SELECT path, tags, deleted_at FROM prohibited_deleted ORDER BY id DESC LIMIT ?",
-                (limit,)
-            )
-            return [
-                {"path": row[0], "tags": json.loads(row[1]), "deleted_at": row[2]}
-                for row in cur.fetchall()
-            ]
+    def _safe_extract_folder_file(self, path: str) -> Tuple[str, str]:
+        """Safely extract folder and filename from path."""
+        try:
+            if not path:
+                return ("Unknown", "Unknown")
+            p = Path(path)
+            return (p.parent.name or "Unknown", p.name or "Unknown")
+        except Exception:
+            return ("Unknown", "Unknown")
 
-    def get_prohibited_count(self) -> int:
-        """Get count of prohibited deletions."""
+    def get_quarantine(self, limit: int = 100) -> List[dict]:
+        """Get list of quarantined cards."""
         with self._cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM prohibited_deleted")
+            cur.execute("""
+                SELECT q.path, q.matches, q.status, q.reason, q.quarantined_at,
+                       c.folder, c.file, c.name, c.creator
+                FROM quarantine q
+                LEFT JOIN cards c ON q.path = c.path
+                ORDER BY q.id DESC LIMIT ?
+            """, (limit,))
+            results = []
+            for row in cur.fetchall():
+                folder, file = self._safe_extract_folder_file(row[0])
+                results.append({
+                    "path": row[0],
+                    "matches": json.loads(row[1]),
+                    "status": row[2],
+                    "reason": row[3],
+                    "quarantined_at": row[4],
+                    "folder": row[5] if row[5] else folder,
+                    "file": row[6] if row[6] else file,
+                    "name": row[7] if row[7] else "",
+                    "creator": row[8] if row[8] else "Unknown"
+                })
+            return results
+
+    def get_quarantine_count(self) -> int:
+        """Get count of quarantined cards."""
+        with self._cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM quarantine")
             return cur.fetchone()[0]
 
-    def index_card(self, filepath: str, delete_prohibited: bool = True) -> Optional[CardEntry]:
+    def get_all_quarantine_paths(self) -> List[str]:
+        """Get all quarantine card paths for bulk operations."""
+        with self._cursor() as cur:
+            cur.execute("SELECT path FROM quarantine")
+            return [row[0] for row in cur.fetchall()]
+
+    def index_card(self, filepath: str) -> Optional[CardEntry]:
         """Index a single card file."""
         metadata = self.extract_metadata(filepath)
         if not metadata:
@@ -885,19 +935,13 @@ class CardIndexDB:
         tags = data.get("tags", [])
         description = data.get("description", "")
         first_mes = data.get("first_mes", "")
+        personality = data.get("personality", "")
+        scenario = data.get("scenario", "")
 
-        # Check for prohibited content
-        if AUTO_DELETE_PROHIBITED or delete_prohibited:
-            is_prohibited, blocked_items = check_prohibited_content(tags, description, first_mes)
-            if is_prohibited:
-                logger.warning(f"PROHIBITED: {filepath} - Matches: {blocked_items}")
-                self.add_prohibited_deleted(filepath, blocked_items)
-                try:
-                    os.remove(filepath)
-                    logger.info(f"DELETED prohibited: {filepath}")
-                except Exception as e:
-                    logger.error(f"Failed to delete {filepath}: {e}")
-                return None
+        # Check for prohibited content and log to quarantine (NO AUTO-DELETE)
+        status, matches, reason = check_prohibited_content_smart(
+            tags, description, first_mes, personality, scenario
+        )
 
         # Determine NSFW
         nsfw = check_nsfw_content(tags, description, first_mes)
@@ -982,6 +1026,12 @@ class CardIndexDB:
                 logger.warning(f"INDEX: INSERT had rowcount=0 for {filepath}")
             elif exists_by_path:
                 logger.debug(f"INDEX: REPLACED existing entry at {entry.path}")
+        
+        # Log to quarantine for manual review if needed (NEVER auto-delete)
+        if status in ["block", "quarantine"]:
+            logger.warning(f"QUARANTINE: {filepath} - {status.upper()} - {reason} - Matches: {matches}")
+            self.add_quarantine(filepath, list(matches), status, reason)
+            # Continue indexing - card is still accessible, just flagged for review
 
         return entry
 
@@ -1204,6 +1254,8 @@ class CardIndexDB:
                 os.remove(path)
             with self._cursor() as cur:
                 cur.execute("DELETE FROM cards WHERE path = ?", (path,))
+                # Also clean up quarantine records
+                cur.execute("DELETE FROM quarantine WHERE path = ?", (path,))
             if path in self.image_hash_objects:
                 del self.image_hash_objects[path]
             return True
@@ -2384,7 +2436,7 @@ DASHBOARD_HTML = """
             <button class="tab" data-tab="lorebooks">Lorebooks</button>
             <button class="tab" data-tab="duplicates">Duplicates</button>
             <button class="tab" data-tab="import">Import</button>
-            <button class="tab" data-tab="prohibited">Prohibited Log</button>
+            <button class="tab" data-tab="quarantine">Quarantine</button>
             <button class="tab" data-tab="tags">Top Tags</button>
         </div>
 
@@ -2499,18 +2551,22 @@ DASHBOARD_HTML = """
                 <div class="actions" style="margin-bottom:20px;">
                     <button class="btn btn-danger" onclick="cleanDuplicates('first')" id="clean-first-btn">Delete Duplicates (Keep First)</button>
                     <button class="btn btn-danger" onclick="cleanDuplicates('largest')" id="clean-largest-btn">Delete Duplicates (Keep Largest)</button>
+                    <button class="btn btn-danger" onclick="cleanDuplicatesWithDescriptionCheck('first')" id="clean-desc-btn" style="background:#e67e22;">Delete Only Matching Descriptions (Keep First)</button>
                 </div>
                 <div id="duplicates-list"></div>
                 <div id="duplicates-loading" class="loading">Loading duplicates...</div>
             </div>
         </div>
 
-        <div id="prohibited" class="tab-content">
+        <div id="quarantine" class="tab-content">
             <div class="section">
-                <h2>Prohibited Content Log</h2>
-                <p style="color:#888;margin-bottom:15px;">Cards automatically deleted</p>
-                <div id="prohibited-list"></div>
-                <div id="prohibited-loading" class="loading">Loading...</div>
+                <h2>Quarantine</h2>
+                <p style="color:#888;margin-bottom:15px;">Flagged cards for manual review - no files are deleted automatically</p>
+                <div class="actions" style="margin-bottom:15px;">
+                    <button class="btn btn-danger" onclick="deleteAllQuarantinedCards()">Delete All</button>
+                </div>
+                <div id="quarantine-list"></div>
+                <div id="quarantine-loading" class="loading">Loading...</div>
             </div>
         </div>
 
@@ -2673,7 +2729,7 @@ DASHBOARD_HTML = """
                     <div class="stat-card"><h3>Unique Creators</h3><div class="value">${data.unique_creators.toLocaleString()}</div></div>
                     <div class="stat-card warning"><h3>Content Dupes</h3><div class="value">${data.content_duplicate_groups}</div></div>
                     <div class="stat-card" style="border-left-color:#e74c3c;"><h3>Image Dupes</h3><div class="value" style="color:#e74c3c;">${data.image_duplicate_groups}</div></div>
-                    <div class="stat-card danger"><h3>Prohibited Deleted</h3><div class="value">${data.prohibited_deleted}</div></div>
+                    <div class="stat-card danger"><h3>Quarantined</h3><div class="value">${data.quarantined}</div></div>
                 `;
             } catch (e) { console.error('Failed to load stats:', e); }
         }
@@ -3172,22 +3228,124 @@ DASHBOARD_HTML = """
             document.getElementById('clean-largest-btn').disabled = false;
         }
 
-        async function loadProhibited() {
-            const list = document.getElementById('prohibited-list');
-            const loading = document.getElementById('prohibited-loading');
+        async function cleanDuplicatesWithDescriptionCheck(keep) {
+            if (!confirm(`Delete duplicate files with IDENTICAL descriptions only, keeping the ${keep} copy?`)) return;
+            document.getElementById('clean-desc-btn').disabled = true;
             try {
-                const res = await fetch('/api/prohibited');
+                const res = await fetch(`/api/duplicates/clean?keep=${keep}&check_description=true`, { method: 'DELETE' });
+                const data = await res.json();
+                showToast(`Deleted ${data.deleted_count} duplicate files with matching descriptions`);
+                loadDuplicates();
+                loadStats();
+            } catch (e) { 
+                showToast('Error cleaning duplicates', true); 
+            }
+            document.getElementById('clean-desc-btn').disabled = false;
+        }
+
+        async function loadQuarantine() {
+            const list = document.getElementById('quarantine-list');
+            const loading = document.getElementById('quarantine-loading');
+            try {
+                const res = await fetch('/api/quarantine');
                 const data = await res.json();
                 loading.style.display = 'none';
-                if (data.deleted.length === 0) {
-                    list.innerHTML = '<div class="empty">No prohibited cards deleted</div>';
+                if (data.cards.length === 0) {
+                    list.innerHTML = '<div class="empty">No cards in quarantine</div>';
                     return;
                 }
-                list.innerHTML = `<p style="margin-bottom:15px;">Total: ${data.total_deleted}</p><table><thead><tr><th>Path</th><th>Blocked Tags</th><th>Deleted At</th></tr></thead><tbody>${data.deleted.map(item => `<tr><td style="font-family:monospace;font-size:0.85rem;">${item.path}</td><td>${item.tags.map(t => `<span class="tag blocked">${t}</span>`).join('')}</td><td>${new Date(item.deleted_at).toLocaleString()}</td></tr>`).join('')}</tbody></table>`;
+                
+                let html = '<div class="card-grid">';
+                data.cards.forEach(card => {
+                    const statusColor = card.status === 'block' ? '#e74c3c' : '#f39c12';
+                    const statusLabel = card.status === 'block' ? 'HIGH PRIORITY' : 'REVIEW';
+                    const matchesHtml = card.matches.map(m => '<p style="font-family:monospace;font-size:0.8rem;color:#e74c3c;">' + m + '</p>').join('');
+                    
+                    html += `
+                        <div class="card" style="position:relative;" data-folder="${encodeURIComponent(card.folder)}" data-file="${encodeURIComponent(card.file)}">
+                            <img src="/cards/${encodeURIComponent(card.folder)}/${encodeURIComponent(card.file)}" 
+                                 alt="${card.name || 'Unknown'}" 
+                                 loading="lazy"
+                                 onclick="openCardEl(this.parentElement)"
+                                 onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect fill=%22%23333%22 width=%22100%22 height=%22100%22/></svg>'">
+                            <div class="card-info">
+                                <h4>${card.name || 'Unknown'}</h4>
+                                <p>${card.creator || 'Unknown'}</p>
+                            </div>
+                            <div class="actions" style="margin-top:10px;">
+                                <button class="btn btn-sm" onclick="approveQuarantinedCard('${card.path.replace(/'/g, "\\'")}')">Approve</button>
+                                <button class="btn btn-sm btn-danger" onclick="deleteQuarantinedCard('${card.path.replace(/'/g, "\\'")}')">Delete</button>
+                            </div>
+                            <div style="background:#1a1a2e;padding:10px;border-radius:6px;margin-top:10px;">
+                                <p style="font-size:0.85rem;color:#888;">Matched content:</p>
+                                ${matchesHtml}
+                            </div>
+                        </div>
+                    `;
+                });
+                html += '</div>';
+                list.innerHTML = html;
             } catch (e) {
                 loading.style.display = 'none';
-                list.innerHTML = '<div class="empty">Error loading prohibited log</div>';
+                list.innerHTML = '<div class="error">Failed to load quarantine</div>';
             }
+        }
+
+        async function deleteQuarantinedCard(path) {
+            if (!confirm(`Delete this card permanently?\n\n${path}`)) return;
+            try {
+                const res = await fetch(`/api/cards/delete?path=${encodeURIComponent(path)}`, { method: 'DELETE' });
+                if (res.ok) {
+                    showToast('Card deleted');
+                    loadQuarantine();
+                    loadStats();
+                } else {
+                    showToast('Failed to delete card', true);
+                }
+            } catch (e) {
+                showToast('Error deleting card', true);
+            }
+        }
+
+        async function approveQuarantinedCard(path) {
+            if (!confirm(`Approve this card?\\n\\n${path}\\n\\nThis will remove it from quarantine but keep it in the index.`)) return;
+            try {
+                const res = await fetch(`/api/quarantine/approve?path=${encodeURIComponent(path)}`, { method: 'POST' });
+                if (res.ok) {
+                    showToast('Card approved');
+                    loadQuarantine();
+                    loadStats();
+                } else {
+                    showToast('Failed to approve card', true);
+                }
+            } catch (e) {
+                showToast('Error approving card', true);
+            }
+        }
+
+        async function deleteAllQuarantinedCards() {
+            if (!confirm('Delete ALL cards in quarantine permanently?\\n\\nThis action cannot be undone!')) return;
+            try {
+                const res = await fetch('/api/quarantine/delete-all', { method: 'DELETE' });
+                if (res.ok) {
+                    const data = await res.json();
+                    showToast(`Deleted ${data.deleted_count} cards`);
+                    loadQuarantine();
+                    loadStats();
+                } else {
+                    showToast('Failed to delete quarantined cards', true);
+                }
+            } catch (e) {
+                showToast('Error deleting quarantined cards', true);
+            }
+        }
+
+        async function viewCard(path) {
+            // Extract folder and filename from path
+            const parts = path.split(/[\\/]/);
+            const filename = parts.pop();
+            const folder = parts.pop();
+            window.open(`/cards/${folder}/${filename}`, '_blank');
         }
 
         async function loadTags() {
@@ -3362,7 +3520,7 @@ DASHBOARD_HTML = """
         loadStats();
         loadLorebookStats();
         loadDuplicates();
-        loadProhibited();
+        loadQuarantine();
         loadTags();
         loadTagFilter();
         loadTopicFilter();
@@ -3908,10 +4066,9 @@ async def api_info():
         "service": "Character Card Index",
         "version": "2.0.0-sqlite",
         "total_cards": index.get_card_count(),
-        "prohibited_deleted": index.get_prohibited_count(),
+        "quarantined": index.get_quarantine_count(),
         "duplicate_groups": len(duplicates),
         "config": {
-            "auto_delete_prohibited": AUTO_DELETE_PROHIBITED,
             "detect_duplicates": DETECT_DUPLICATES,
             "database": DB_FILE
         },
@@ -3921,7 +4078,7 @@ async def api_info():
             "card_image": "/cards/{folder}/{filename}",
             "stats": "/api/stats",
             "tags": "/api/tags",
-            "prohibited": "/api/prohibited",
+            "quarantine": "/api/quarantine",
             "duplicates": "/api/duplicates",
             "clean_duplicates": "DELETE /api/duplicates/clean"
         }
@@ -4002,7 +4159,7 @@ async def get_stats():
         "sfw_count": stats["sfw_count"],
         "unique_creators": stats["unique_creators"],
         "unique_tags": len(tags),
-        "prohibited_deleted": index.get_prohibited_count(),
+        "quarantined": index.get_quarantine_count(),
         "content_duplicate_groups": len([p for p in duplicates.values() if len(p) > 1]),
         "image_duplicate_groups": len([p for p in image_duplicates.values() if len(p) > 1]),
         "image_hash_enabled": IMAGE_HASH_AVAILABLE,
@@ -4234,14 +4391,66 @@ async def debug_paths(
     }
 
 
-@app.get("/api/prohibited")
-async def get_prohibited():
-    """Get list of prohibited cards that were deleted."""
+@app.get("/api/quarantine")
+async def get_quarantine():
+    """Get list of quarantined cards for manual review."""
     return {
-        "total_deleted": index.get_prohibited_count(),
-        "auto_delete_enabled": AUTO_DELETE_PROHIBITED,
-        "deleted": index.get_prohibited_deleted(100)
+        "total_quarantined": index.get_quarantine_count(),
+        "cards": index.get_quarantine(100)
     }
+
+
+@app.post("/api/quarantine/approve")
+async def approve_quarantine_card(path: str = Query(...)):
+    """Approve a quarantined card - removes from quarantine, keeps in index."""
+    with index._cursor() as cur:
+        cur.execute("DELETE FROM quarantine WHERE path = ?", (path,))
+        if cur.rowcount > 0:
+            return {"success": True, "path": path, "action": "approved"}
+        else:
+            raise HTTPException(status_code=404, detail="Card not found in quarantine")
+
+
+@app.delete("/api/quarantine/delete-all")
+async def delete_all_quarantined():
+    """Delete all cards in quarantine."""
+    paths = index.get_all_quarantine_paths()
+    deleted = 0
+    failed_paths = []
+    
+    for path in paths:
+        if index.delete_card(path):
+            deleted += 1
+        else:
+            failed_paths.append(path)
+    
+    # Clean up quarantine records for paths that no longer exist
+    if failed_paths:
+        for path in failed_paths:
+            if not os.path.exists(path):
+                try:
+                    with index._cursor() as cur:
+                        cur.execute("DELETE FROM quarantine WHERE path = ?", (path,))
+                except Exception as e:
+                    logger.error(f"Failed to clean quarantine record for {path}: {e}")
+    
+    return {"success": True, "deleted_count": deleted, "failed_count": len(failed_paths)}
+
+
+# Keep old endpoint for backwards compatibility
+@app.get("/api/prohibited")
+async def get_prohibited_legacy():
+    """Legacy endpoint - use /api/quarantine instead."""
+    return await get_quarantine()
+
+
+@app.delete("/api/prohibited/delete")
+async def delete_prohibited_card(path: str = Query(...)):
+    """Manually delete a prohibited card after review."""
+    if index.delete_card(path):
+        return {"success": True, "deleted": path}
+    else:
+        raise HTTPException(status_code=404, detail="Card not found")
 
 
 @app.get("/api/duplicates")
@@ -4473,7 +4682,8 @@ async def ignore_duplicate_group(paths: List[str] = Query(..., description="Path
 @app.delete("/api/duplicates/clean")
 async def clean_duplicates(
     keep: str = Query("first", description="Which to keep: 'first' or 'largest'"),
-    type: str = Query("all", description="Which duplicates: 'content', 'image', or 'all'")
+    type: str = Query("all", description="Which duplicates: 'content', 'image', or 'all'"),
+    check_description: bool = Query(False, description="Only delete if descriptions match")
 ):
     """Delete duplicate files, keeping one copy of each."""
     if not DETECT_DUPLICATES:
@@ -4488,6 +4698,28 @@ async def clean_duplicates(
         valid_paths = [p for p in paths if p not in already_deleted and os.path.exists(p)]
         if len(valid_paths) <= 1:
             return
+
+        # If check_description is True, only process if ALL descriptions match
+        if check_description:
+            descriptions = []
+            for path in valid_paths:
+                entry = index.get_card_by_path(path)
+                if entry:
+                    # Use description_preview from database
+                    descriptions.append(entry.description_preview or '')
+                else:
+                    # Try to extract from metadata as fallback
+                    metadata = index.extract_metadata(path)
+                    if metadata and 'data' in metadata:
+                        desc = metadata['data'].get('description', '')
+                        descriptions.append(desc or '')
+                    else:
+                        descriptions.append('')
+            
+            # If descriptions differ, skip this group
+            # Note: Empty descriptions ('') are treated as matching each other
+            if len(set(descriptions)) > 1:
+                return
 
         if keep == "largest":
             paths_with_size = [(p, os.path.getsize(p)) for p in valid_paths]

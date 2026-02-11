@@ -87,7 +87,7 @@ sudo systemctl start card-index
 | `DELETE /api/duplicates/clean` | Remove duplicates (keep one) |
 | `POST /api/duplicates/ignore` | Mark group as non-duplicate |
 | `GET /api/cards/similar` | Find similar cards |
-| `GET /api/prohibited` | View deleted prohibited cards |
+| `GET /api/quarantine` | View quarantined cards for manual review |
 
 ### Index Management
 | Endpoint | Description |
@@ -123,7 +123,6 @@ sudo systemctl start card-index
 | `CARD_DIRS` | (required) | List of directories to index (see note below) |
 | `CARD_HOST` | `0.0.0.0` | Host to bind to |
 | `CARD_PORT` | `8787` | Port to bind to |
-| `CARD_AUTO_DELETE` | `true` | Auto-delete prohibited content |
 | `CARD_DETECT_DUPES` | `true` | Enable duplicate detection |
 | `CARD_DB_FILE` | `/var/lib/card-index/cards.db` | SQLite database file |
 | `CARD_WATCH_FILES` | `true` | Enable file watching for auto-detection |
@@ -142,30 +141,27 @@ CARD_DIRS=/data/cards:/mnt/more-cards
 
 Windows drive letters (like `C:`) are automatically detected and handled correctly.
 
-## Prohibited Content Filtering
+## Content Quarantine System
 
-**Warning: By default, CardVault uses strict content filtering that automatically deletes cards matching prohibited patterns. This may result in false positives.**
+CardVault uses smart context-aware content filtering to flag cards for manual review. **Cards are never automatically deleted by the system** - they remain fully accessible and indexed, but flagged items appear in the Quarantine tab for your review and manual action.
 
 ### How It Works
 
 When a card is indexed, CardVault checks:
 1. **Tags** - Exact matches against a blocklist
 2. **Description & First Message** - Pattern matching for prohibited content
-3. **Age References** - Context-aware detection of minor age mentions
+3. **Age References** - Context-aware detection with backstory consideration
+4. **NSFW Context** - Analyzes if concerning patterns appear in NSFW contexts
 
-Cards that match prohibited patterns are:
-- Logged to the prohibited deletions table (viewable at `/api/prohibited`)
-- **Automatically deleted from disk**
+Cards that match patterns are:
+- **Fully indexed and accessible** - searchable, viewable, downloadable
+- **Logged to quarantine** - visible in Quarantine tab for manual review
+- **Never auto-deleted** - you have full control
 
-### Disabling Auto-Delete
+### Review Statuses
 
-To prevent automatic deletion, set in your `.env` file:
-
-```bash
-CARD_AUTO_DELETE=false
-```
-
-With this setting, prohibited cards will still be logged but **not deleted**.
+- **block** (High Priority) - Strong match, recommended for manual review
+- **quarantine** (Review) - Potential match, may be context-dependent
 
 ### Customizing the Blocklists
 
@@ -187,7 +183,7 @@ BLOCKED_DESCRIPTION_PATTERNS_STRICT = [
     ...
 ]
 
-# Context-sensitive age patterns (may trigger quarantine)
+# Context-sensitive age patterns (analyzed with surrounding text)
 AGE_PATTERNS_CONTEXT = [
     re.compile(r'\bage\s*[:\-]?\s*([1-9]|1[0-7])\b', re.IGNORECASE),
     ...
@@ -199,13 +195,16 @@ To customize:
 2. Modify the sets/lists as needed
 3. Restart the server
 
-### Viewing Deleted Cards
+### Viewing Quarantined Cards
 
-Check which cards were flagged and deleted:
-- **Web UI**: Click "Prohibited" tab in the dashboard
-- **API**: `GET /api/prohibited`
+Check which cards are flagged for review:
+- **Web UI**: Click "Quarantine" tab in the dashboard
+- **API**: `GET /api/quarantine`
 
-This shows the filepath and matched patterns for each deleted card.
+Each quarantined card shows:
+- File path and status (block/quarantine)
+- Matched patterns and reason
+- View and Delete action buttons
 
 ## Web Dashboard
 
@@ -215,7 +214,7 @@ Features:
 - **Search** - Full-text search with tag filtering
 - **Lorebooks** - Browse and search lorebook collection
 - **Duplicates** - View and manage duplicate cards
-- **Prohibited Log** - View deleted prohibited content
+- **Quarantine** - Review and manage flagged content
 - **Statistics** - Total cards, NSFW count, top tags/creators
 - **Card Details** - Click any card to view full info and import
 
